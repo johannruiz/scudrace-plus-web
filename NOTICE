@@ -1,0 +1,45 @@
+Daytona USA 2 Power Edition Recomp
+Copyright 2026 Johann Ruiz
+
+This product includes software developed by Johann Ruiz
+(Daytona USA 2 Power Edition Recomp and its web port,
+https://johannruiz.github.io/daytona-usa-2-web/).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Attribution: any work that uses, copies, modifies or is based on this
+project must keep this NOTICE file, or its attribution text, in its source
+and in its documentation, about box or credits, as required by section 4(d)
+of the Apache License 2.0. Please credit it as:
+
+    Daytona USA 2 Power Edition Recomp by Johann Ruiz
+
+Scope
+-----
+The Apache License 2.0 covers the original work in this project only.
+Third-party components keep their own licenses; see THIRD_PARTY.md and the
+licenses/ folder. Main components:
+
+- model3recomp, sp00nznet (MIT): board runtime and PowerPC recompiler.
+- LostWorldNative, snicolast (MIT): Real3D scene decoder and renderer,
+  also ported to WGSL for the web version.
+- Musashi 68000 core, Karl Stenerud (license kept with its source).
+- SoftFloat, John R. Hauser (license kept with its source).
+- MAME-derived parts (BSD-3-Clause): 315-5881 security cipher and
+  Model 3 communication board research. Notices in licenses/.
+- PL_MPEG, Dominic Szablewski (MIT): MP2 decoder for the music board.
+- miniz (MIT): ROM ZIP reading.
+- Sega Rally Recomp link transport (BSD-3-Clause), native build only.
+- SDL3 (zlib), native build only.
+- PeerJS, Michelle Bu and Eric Zhang (MIT), web version.
+- VT323 font (SIL Open Font License 1.1), web version.
+
+Files kept under reference/ for comparison keep their original notices and
+licenses (including GPL-3.0 files from Supermodel); they are not part of the
+built program and are not relicensed.
+
+Scud Race and all related names, logos and assets (including the Scud
+Race logo shown in the web menu) belong to SEGA.
+Daytona USA 2 and all related names, logos and assets belong to SEGA.
+This is an unofficial fan project, not affiliated with or endorsed by SEGA.
+No ROMs are included.
