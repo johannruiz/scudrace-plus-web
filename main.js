@@ -39,6 +39,29 @@ import { createRoomArrivals } from './d1/room-arrivals.js';
 import { createRoomSystemAlerts } from './d1/room-system-alerts.js';
 
 const $ = id => document.getElementById(id);
+// Error report (2026-11-19): an iPhone showed only "unknown error" (an error that
+// came with no message) and no way to tell where. The card (showError) now carries
+// the step, the error's type and stack, memory, WebGPU limits and the last lines of
+// the console, which are kept here, with uncaught errors and rejections.
+const recentLog = [];
+for (const level of ['log', 'warn', 'error']) {
+  const write = console[level].bind(console);
+  console[level] = (...a) => {
+    try { recentLog.push(`${level[0]} ${a.map(x => x instanceof Error || (x && typeof x === 'object' && 'message' in x) ? describeError(x) : typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' ')}`.slice(0, 260)); if (recentLog.length > 16) recentLog.shift(); } catch {}
+    write(...a);
+  };
+}
+addEventListener('error', e => console.error('[uncaught]', e.error ? describeError(e.error) : e.message, e.filename ? `${e.filename.split('/').pop()}:${e.lineno}` : ''));
+addEventListener('unhandledrejection', e => console.error('[unhandled]', describeError(e.reason)));
+let stage = 'loading the page', gpuInfo = '', gpuLimits = null;
+function describeError(e) {
+  if (e === undefined || e === null) return `no error object (${e})`;
+  if (typeof e !== 'object') return `${typeof e}: ${String(e) || '(empty)'}`;
+  const name = e.name || e.constructor?.name || 'Object', message = e.message || e.reason || '';
+  let own = ''; try { own = JSON.stringify(e); if (own === '{}') own = ''; } catch {}
+  const stack = typeof e.stack === 'string' ? e.stack.split('\n').filter(Boolean).slice(0, 4).map(s => s.trim()).join(' | ') : '';
+  return `${name}: ${message || '(no message)'}${own ? ' ' + own.slice(0, 200) : ''}${stack ? ' @ ' + stack.slice(0, 400) : ''}`;
+}
 // Footer version from version.js, the same one the rooms check (2026-11-18).
 { const el = $('buildVersion'), time = document.createElement('time'), [y, m, d] = RELEASE_DATE.split('-'); time.dateTime = RELEASE_DATE; time.textContent = `${d}.${m}.${y.slice(2)}`; el?.replaceChildren(`v${CLIENT_VERSION} · `, time); }
 const html = document.documentElement;
@@ -256,15 +279,35 @@ let errorShown = false;
 function showError(title, text, detail = '') {
   if (errorShown) { if (detail) console.error('[error]', title, detail); return; }
   errorShown = true;
-  console.error('[error]', title, detail || text);
   preparing = false; $('restartNotice').hidden = true;
   $('errorTitle').textContent = title; $('errorText').textContent = text;
-  const d = $('errorDetail'); d.textContent = detail ? `${String(detail).slice(0, 2000)}\nv${CLIENT_VERSION} · ${navigator.userAgent}` : ''; d.hidden = !detail;
+  // The whole report in the box (and Copy details): a screenshot of it says what failed.
+  const d = $('errorDetail');
+  d.textContent = [title, String(detail || '(no detail)').slice(0, 1500), '', errorContext(), '', 'Recent log:', ...recentLog.slice(-10), '', `v${CLIENT_VERSION} · ${navigator.userAgent}`].join('\n');
+  d.hidden = false; $('errorCopy').textContent = 'Copy details';
+  console.error('[error]', title, detail || text);
   $('errorNotice').hidden = false; $('errorReload').focus({ preventScroll: true });
+}
+// Where the game was and what it had when the error came.
+function errorContext() {
+  const r = renderer || probed, lines = [`Step: ${stage}${stage.startsWith('checking WebGPU') ? ` (${Daytona2Renderer.step || '-'})` : ''}`];
+  try {
+    if (host?.memory) lines.push(`Engine: ${Math.round(host.memory.buffer.byteLength / 1048576)} MB, field ${host.ctl?.[8] ?? '-'}, ${host.fields || 0} shown, ${r?.stats?.staticVertices || 0} model vertices`);
+    if (r?.pull?.statics) lines.push(`GPU model buffer: ${Math.round(r.pull.statics.size / 1048576)} MB, target ${r.targetW}x${r.targetH}`);
+    const lim = r?.device?.limits || gpuLimits;
+    lines.push(`WebGPU: ${gpuInfo || '-'}${lim ? `; max buffer ${Math.round(lim.maxBufferSize / 1048576)} MB, storage ${Math.round(lim.maxStorageBufferBindingSize / 1048576)} MB` : ''}`);
+    lines.push(`Device: screen ${screen.width}x${screen.height} @${devicePixelRatio}, isolated ${globalThis.crossOriginIsolated}, cores ${navigator.hardwareConcurrency || '?'}, memory ${navigator.deviceMemory || '?'} GB`);
+  } catch (e) { lines.push('context: ' + e); }
+  return lines.join('\n');
 }
 $('errorReload').addEventListener('click', () => location.reload());
 $('errorClose').addEventListener('click', () => { $('errorNotice').hidden = true; });
-const errorText = e => String(e?.message || e?.reason || e || 'unknown error');
+$('errorCopy').addEventListener('click', async () => {
+  const text = $('errorDetail').textContent;
+  try { await navigator.clipboard.writeText(text); $('errorCopy').textContent = 'Copied'; }
+  catch { const range = document.createRange(); range.selectNodeContents($('errorDetail')); getSelection().removeAllRanges(); getSelection().addRange(range); $('errorCopy').textContent = 'Selected: copy it'; }
+});
+const errorText = describeError;
 // The page's own check before the ROM is chosen: no WebGPU, or no adapter (no graphics acceleration).
 class GPUUnavailable extends Error {}
 // The whole renderer starts here, while the page loads (user, 2026-11-19): a
@@ -272,13 +315,15 @@ class GPUUnavailable extends Error {}
 // so it cannot join a room and hold up the other drivers. The race uses it.
 // gpuReady, probed: declared with the page state (view() reads them).
 async function checkWebGPU() {
+  stage = 'checking WebGPU';
   if (!('gpu' in navigator)) throw new GPUUnavailable('This browser has no WebGPU.');
   let adapter = null; try { adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); } catch (e) { throw new GPUUnavailable('WebGPU failed: ' + errorText(e)); }
   if (!adapter) throw new GPUUnavailable('WebGPU found no graphics adapter (graphics acceleration off or not supported).');
+  try { const i = adapter.info || {}; gpuInfo = [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(' ') || 'adapter'; gpuLimits = adapter.limits; } catch {}
   try { probed = await Daytona2Renderer.create($('screen'), './shaders/', { gpuTilegen: !params.has('cputile') }); }
   catch (e) { throw new GPUUnavailable(errorText(e)); }
   watchGPU(probed);
-  gpuReady = true;
+  gpuReady = true; stage = 'loading the engine';
 }
 function watchGPU(r) {
   r.device.addEventListener('uncapturederror', e => {
@@ -300,6 +345,7 @@ async function loadEngine() {
     : showError('The game stopped', 'The arcade engine stopped with an error. Reload the page; if it happens again, please report the text below.', errorText(e));
   if (fieldHz60) host.fieldMs = FIELD_MS_60;
   await host.load('./scudplus.js');
+  stage = 'waiting for the ROM';
   host.backupSaved = bytes => saveStored(nvramName, bytes);   // the engine worker sends the saved file
   return host;
 }
@@ -310,14 +356,14 @@ engineReady.then(() => status('Choose your ROM to start.')).catch(e => {
   else showError('The game cannot start', 'The engine could not load in this browser.', e.message);
 });
 function romLoaded(text) {
-  romReady = true; status(text, true);
+  romReady = true; stage = 'ROM ready (modes)'; status(text, true);
   $('message').textContent = 'Your arcade is ready.'; $('fileLabel').textContent = 'Change ROM ZIP';
   view('modes'); $('singlePlayer').focus({ preventScroll: true });
   continueIntent();
 }
 async function importZip(file) {
   await engineReady;
-  status('Checking ROM chips…');
+  status('Checking ROM chips…'); stage = 'checking the ROM';
   const r = await host.importROM(new Uint8Array(await file.arrayBuffer()));
   if (!r.ok) {
     status(r.code === 1 ? 'This is not a readable ZIP.' : r.code === 2 ? `Missing or modified chip: ${r.missing}. Scud Race Plus (scudplus) is required.` : 'ROM import failed.');
@@ -387,7 +433,7 @@ function continueIntent() {
 async function startEngine({ backup, env = {} }) {
   if (started) return;
   if (!gpuReady) { $('errorNotice').hidden = !errorShown; return; }   // never without a working renderer (checkWebGPU)
-  started = running = true;
+  started = running = true; stage = 'starting the race engine';
   // A restart notice already up (Applying your race setup…) stays; else the short preparing one
   preparing = true; if ($('restartNotice').hidden) restartNotice({ view: sessionKind === 'link' ? 'prepare-link' : 'prepare-single' });
   $('overlay').hidden = true; html.classList.remove('launcher-open'); html.classList.add('playing');
@@ -451,6 +497,7 @@ const rumbleLog = rumbleLogOn
   ? startRumbleLog({ getModule: () => host?.module, getInput: () => controls.current, menuOpen: () => !$('overlay').hidden }) : null;
 function onField(h) {
   if (preparing) { preparing = false; restartNotice(null); }
+  if (h.fields === 1) stage = 'running';
   rumbleLog?.();
   if (++fpsTick % 30 === 0) {
     $('fps').textContent = h.fps().toFixed(1);   // game fields per second

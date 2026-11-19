@@ -25,23 +25,29 @@ export function computeLayout(winW, winH, maxAspect) {   // r3d_renderer.cpp com
 
 export class Daytona2Renderer {
   static async create(canvas, shaderBase = './shaders/', { gpuTilegen = true } = {}) {
+    // step: where creation got to, for the error card (main.js errorContext, 2026-11-19).
+    Daytona2Renderer.step = 'adapter';
     if (!navigator.gpu) throw new Error('WebGPU is not available in this browser');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('No WebGPU adapter');
     // Model-space vertices of the GPU transform stay resident (up to ~96 MB).
     const want = 256 << 20, limits = adapter.limits;
+    Daytona2Renderer.step = 'device';
     const device = await adapter.requestDevice({ requiredLimits: {
       maxStorageBufferBindingSize: Math.min(limits.maxStorageBufferBindingSize, want),
       maxBufferSize: Math.min(limits.maxBufferSize, want) } });
+    Daytona2Renderer.step = 'shader files';
     const [r3d, compose, tilegen] = await Promise.all(['r3d.wgsl', 'compose.wgsl', 'tilegen.wgsl'].map(n => fetch(shaderBase + n).then(r => r.text())));
     // The whole renderer is checked here, before the player can choose a mode
     // (2026-11-19): shaders, pipelines and targets that this browser's WebGPU
     // refuses throw now instead of leaving a black picture in a race or a room.
     for (const scope of ['validation', 'out-of-memory', 'internal']) device.pushErrorScope(scope);
-    let renderer, thrown = null;
+    let renderer, thrown = null; Daytona2Renderer.step = 'pipelines and targets';
     try { renderer = new Daytona2Renderer(canvas, device, r3d, compose, gpuTilegen ? tilegen : null); renderer.ensureTargets(SCREEN_W, SCREEN_H); } catch (e) { thrown = e; }
     const errors = []; for (let i = 0; i < 3; i++) { const e = await device.popErrorScope(); if (e) errors.push(e.message); }
-    if (thrown || errors.length) { device.destroy(); throw new Error('WebGPU refused the renderer: ' + (thrown?.message || errors.join(' | '))); }
+    Daytona2Renderer.step = 'checked';
+    // thrown may carry no message (or be no Error at all): its type and stack go in too
+    if (thrown !== null || errors.length) { device.destroy(); throw new Error('WebGPU refused the renderer: ' + (thrown !== null ? `${thrown?.name || typeof thrown}: ${thrown?.message || '(no message)'} ${String(thrown?.stack || '').split(String.fromCharCode(10))[0]}` : errors.join(' | '))); }
     return renderer;
   }
   constructor(canvas, device, r3dCode, composeCode, tilegenCode = null) {
