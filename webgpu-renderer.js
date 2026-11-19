@@ -12,7 +12,8 @@ const TILEGEN_SIZE = 0x190000, TILE_CHUNK = 4096, TILE_CHUNKS = TILEGEN_SIZE / T
 const VERTEX_BYTES = 80, VIEWPORT_FLOATS = 56, DRAW_STRIDE = 256;
 // GPU vertex transform (web_bridge.cpp WebFrame 29..38, r3d_scene.h): refs,
 // model-space vertices kept across frames, instances, colour-table entries.
-const PACKET_WORDS = 42, REF_BYTES = 8, STATIC_BYTES = 96, INSTANCE_BYTES = 80;
+const STATIC_BLOCK = 65536;   // r3d_scene.h R3D_STATIC_BLOCK
+const PACKET_WORDS = 43, REF_BYTES = 8, STATIC_BYTES = 96, INSTANCE_BYTES = 80;
 
 export function computeLayout(winW, winH, maxAspect) {   // r3d_renderer.cpp compute_layout
   const aspect = winH > 0 ? winW / winH : 4 / 3;
@@ -33,7 +34,15 @@ export class Daytona2Renderer {
       maxStorageBufferBindingSize: Math.min(limits.maxStorageBufferBindingSize, want),
       maxBufferSize: Math.min(limits.maxBufferSize, want) } });
     const [r3d, compose, tilegen] = await Promise.all(['r3d.wgsl', 'compose.wgsl', 'tilegen.wgsl'].map(n => fetch(shaderBase + n).then(r => r.text())));
-    return new Daytona2Renderer(canvas, device, r3d, compose, gpuTilegen ? tilegen : null);
+    // The whole renderer is checked here, before the player can choose a mode
+    // (2026-11-19): shaders, pipelines and targets that this browser's WebGPU
+    // refuses throw now instead of leaving a black picture in a race or a room.
+    for (const scope of ['validation', 'out-of-memory', 'internal']) device.pushErrorScope(scope);
+    let renderer, thrown = null;
+    try { renderer = new Daytona2Renderer(canvas, device, r3d, compose, gpuTilegen ? tilegen : null); renderer.ensureTargets(SCREEN_W, SCREEN_H); } catch (e) { thrown = e; }
+    const errors = []; for (let i = 0; i < 3; i++) { const e = await device.popErrorScope(); if (e) errors.push(e.message); }
+    if (thrown || errors.length) { device.destroy(); throw new Error('WebGPU refused the renderer: ' + (thrown?.message || errors.join(' | '))); }
+    return renderer;
   }
   constructor(canvas, device, r3dCode, composeCode, tilegenCode = null) {
     this.canvas = canvas; this.device = device;
@@ -119,6 +128,23 @@ export class Daytona2Renderer {
       { binding: 2, resource: this.back.createView() }, { binding: 3, resource: this.nearest },
       { binding: 4, resource: this.linear }, { binding: 5, resource: { buffer: this.composeUniform } }] });
   }
+  // The model vertex buffer with room for `bytes`, keeping what it holds: the
+  // engine no longer has those vertices (uploadPull). Scud preloads ~1 M (~97 MB)
+  // in its first seconds, where Daytona USA 2 adds ~11 MB: over 48 MB, room for
+  // 25% more (was 100%: a 162 MB buffer).
+  growStatics(bytes) {
+    const P = this.pull, old = P.statics, need = Math.max(256, bytes);
+    if (old && old.size >= need) return;
+    const size = Math.min(this.device.limits.maxStorageBufferBindingSize, Math.max(need * (need > 48 << 20 ? 1.25 : 2), 1 << 16)) + 3 & ~3;
+    if (size < need) throw new Error(`[webgpu] statics: ${need} bytes over the device limit`);
+    const buffer = this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    if (old && P.uploaded) {   // queued after the writes that filled the old one
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(old, 0, buffer, 0, P.uploaded * STATIC_BYTES);
+      this.device.queue.submit([encoder.finish()]);
+    }
+    old?.destroy(); P.statics = buffer; P.group = null;
+  }
   // A storage buffer of the pull set with room for `bytes`; false if unchanged.
   ensurePull(name, bytes, spare = 1.5) {
     const b = this.pull[name], need = Math.max(256, bytes);
@@ -146,13 +172,33 @@ export class Daytona2Renderer {
     put('instances', u32[33], u32[32] * INSTANCE_BYTES);
     put('colours', u32[35], u32[34] * 4);
     put('cpu', u32[2], u32[1] * VERTEX_BYTES);
-    const count = u32[36], generation = u32[38];
-    if (generation !== P.generation) { P.generation = generation; P.uploaded = 0; }
-    if (this.ensurePull('statics', count * STATIC_BYTES, 2)) P.uploaded = 0;   // a new buffer starts empty
-    if (count > P.uploaded) {
-      queue.writeBuffer(P.statics, P.uploaded * STATIC_BYTES, heap.buffer, u32[37] + P.uploaded * STATIC_BYTES, (count - P.uploaded) * STATIC_BYTES);
-      this.stats.staticVertices = count; P.uploaded = count;
+    // Model vertices: the engine keeps only those the GPU does not have yet
+    // (2026-11-19, r3d_scene.h static_blocks_), in blocks from vertex `base`
+    // (word 42), and the page tells the engine how far it got (ctl 27/28,
+    // engine-host.js present), so the GPU buffer is the only full copy.
+    const count = u32[36], generation = u32[38], base = u32[42];
+    if (generation !== P.generation) {   // a new set from vertex 0: a buffer sized for it
+      P.generation = generation; P.uploaded = 0; P.statics?.destroy(); P.statics = null; P.group = null;
     }
+    this.growStatics(count * STATIC_BYTES);
+    if (P.uploaded < base) {   // never expected: the engine drops only what the page reported
+      if (!this.staticGap) { this.staticGap = true; console.error(`[webgpu] model vertices ${P.uploaded}..${base} were dropped before upload`); }
+      P.uploaded = base;
+    }
+    if (count > P.uploaded) {
+      // Word 37 lists the engine's blocks of STATIC_BLOCK vertices from `base` on
+      // (r3d_scene.h R3D_STATIC_BLOCK): one write each, at most 6 MB, not one of
+      // ~85 MB (2026-11-19: an iPhone stopped on the boot screen; Safari has less
+      // graphics memory and copies each write to its GPU process).
+      const blocks = new Uint32Array(heap.buffer, u32[37], Math.ceil((count - base) / STATIC_BLOCK));
+      for (let i = P.uploaded; i < count;) {
+        const end = Math.min(count, (Math.floor(i / STATIC_BLOCK) + 1) * STATIC_BLOCK);
+        queue.writeBuffer(P.statics, i * STATIC_BYTES, heap.buffer, blocks[Math.floor((i - base) / STATIC_BLOCK)] + (i % STATIC_BLOCK) * STATIC_BYTES, (end - i) * STATIC_BYTES);
+        i = end;
+      }
+      P.uploaded = count;
+    }
+    this.stats.staticVertices = count;
     if (!P.group) P.group = this.device.createBindGroup({ layout: this.r3dLayout2, entries:
       ['refs', 'statics', 'instances', 'cpu', 'colours', 'prevm'].map((name, binding) => ({ binding, resource: { buffer: P[name] || P.instances } })) });
     this.vertexCount = u32[30];

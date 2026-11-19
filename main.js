@@ -54,6 +54,7 @@ delete display.fps;   // the simulation rate is always shown (user, 2026-11-12)
 const held = new Set();
 let publicDirectory = null;
 let outOfRace = false, preparing = false;   // preparing: the cabinet notice until the first field   // this cabinet left the linked race after stopping (outOfRaceCheck)
+let gpuReady = false, probed = null;   // checkWebGPU (the renderer started while the page loads)
 let host, renderer, engineReady, started = false, running = false, romReady = false, sessionKind = null, nvramName = 'cabinet';
 // The arcade's own field rate, 57.524 Hz, by default (user, 2026-11-18: "as
 // the original"; Daytona USA 2 Web runs 60). The fields follow the display in
@@ -182,6 +183,7 @@ setInterval(() => {
 // 'entry' (create / join a room) and 'room' (the starting grid).
 const utilities = document.querySelector('.menu-quick-controls'), utilitiesHome = utilities.parentElement;
 function view(name) {
+  if (!gpuReady && (name === 'single' || name === 'entry' || name === 'room')) { $('errorNotice').hidden = !errorShown; return; }   // no play without a working renderer
   publicDirectory?.setBrowsing(name === 'entry');
   const panel = name === 'single' || name === 'entry' || name === 'room';
   $('dropzone').hidden = name !== 'rom'; $('playerModes').hidden = name !== 'modes';
@@ -245,16 +247,68 @@ const menuControls = mountMenuGamepad({ root: $('menuDialog'), hints: $('menuGam
 html.classList.add('launcher-open');
 
 // ---- engine and ROM --------------------------------------------------------
+// Errors the player must see (user, 2026-11-19): without graphics acceleration
+// the start just stayed black, and on an iPhone it stopped on the boot screen,
+// with the reason only in the console. The first one stays on screen, with
+// its technical detail for a report.
+const GPU_HELP = 'Scud Race Plus draws with WebGPU, the browser’s access to your graphics card. Turn on hardware acceleration in your browser settings (Chrome and Edge: Settings → System), update the browser and the graphics driver, or try a current Chrome, Edge or Safari.';
+let errorShown = false;
+function showError(title, text, detail = '') {
+  if (errorShown) { if (detail) console.error('[error]', title, detail); return; }
+  errorShown = true;
+  console.error('[error]', title, detail || text);
+  preparing = false; $('restartNotice').hidden = true;
+  $('errorTitle').textContent = title; $('errorText').textContent = text;
+  const d = $('errorDetail'); d.textContent = detail ? `${String(detail).slice(0, 2000)}\nv${CLIENT_VERSION} · ${navigator.userAgent}` : ''; d.hidden = !detail;
+  $('errorNotice').hidden = false; $('errorReload').focus({ preventScroll: true });
+}
+$('errorReload').addEventListener('click', () => location.reload());
+$('errorClose').addEventListener('click', () => { $('errorNotice').hidden = true; });
+const errorText = e => String(e?.message || e?.reason || e || 'unknown error');
+// The page's own check before the ROM is chosen: no WebGPU, or no adapter (no graphics acceleration).
+class GPUUnavailable extends Error {}
+// The whole renderer starts here, while the page loads (user, 2026-11-19): a
+// browser that cannot draw the game never reaches Single player or Multiplayer,
+// so it cannot join a room and hold up the other drivers. The race uses it.
+// gpuReady, probed: declared with the page state (view() reads them).
+async function checkWebGPU() {
+  if (!('gpu' in navigator)) throw new GPUUnavailable('This browser has no WebGPU.');
+  let adapter = null; try { adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); } catch (e) { throw new GPUUnavailable('WebGPU failed: ' + errorText(e)); }
+  if (!adapter) throw new GPUUnavailable('WebGPU found no graphics adapter (graphics acceleration off or not supported).');
+  try { probed = await Daytona2Renderer.create($('screen'), './shaders/', { gpuTilegen: !params.has('cputile') }); }
+  catch (e) { throw new GPUUnavailable(errorText(e)); }
+  watchGPU(probed);
+  gpuReady = true;
+}
+function watchGPU(r) {
+  r.device.addEventListener('uncapturederror', e => {
+    const m = e.error?.message || String(e.error); console.error('[webgpu]', m);
+    if (e.error?.constructor?.name === 'GPUOutOfMemoryError') showError('Out of graphics memory', 'The browser could not give the game enough graphics memory. Close other tabs and apps, then reload the page.', m);
+    else showError('Graphics error', 'The graphics card reported an error, so the picture may be wrong or stopped. Reload the page; if it happens again, please report the text below.', m);
+  });
+  r.device.lost.then(info => {
+    if (info.reason === 'destroyed' || host?.stopped) return;
+    gpuReady = false;
+    showError('The graphics card stopped', 'The browser stopped the game’s graphics (WebGPU device lost), often because it ran out of graphics memory. Close other tabs and apps, then reload the page.', info.message || info.reason || '');
+  });
+}
 async function loadEngine() {
-  if (!('gpu' in navigator)) throw new Error('This browser has no WebGPU. Use a current Chrome, Edge or another WebGPU browser.');
+  await checkWebGPU();
   host = new EngineHost({ audio, input: controls, link, onField: h => onField(h) });
+  host.onError = (kind, e) => kind === 'render'
+    ? showError('Graphics error', 'Drawing the game failed, so the picture may be wrong or stopped. Reload the page; if it happens again, please report the text below.', errorText(e))
+    : showError('The game stopped', 'The arcade engine stopped with an error. Reload the page; if it happens again, please report the text below.', errorText(e));
   if (fieldHz60) host.fieldMs = FIELD_MS_60;
   await host.load('./scudplus.js');
   host.backupSaved = bytes => saveStored(nvramName, bytes);   // the engine worker sends the saved file
   return host;
 }
 engineReady = loadEngine();
-engineReady.then(() => status('Choose your ROM to start.')).catch(e => status(e.message));
+engineReady.then(() => status('Choose your ROM to start.')).catch(e => {
+  status(e.message);
+  if (e instanceof GPUUnavailable) showError('Your graphics card is not available', GPU_HELP, e.message);
+  else showError('The game cannot start', 'The engine could not load in this browser.', e.message);
+});
 function romLoaded(text) {
   romReady = true; status(text, true);
   $('message').textContent = 'Your arcade is ready.'; $('fileLabel').textContent = 'Change ROM ZIP';
@@ -286,7 +340,11 @@ async function devRoms() {
   await engineReady;
   for (const n of ['crom', 'banked_crom', 'vrom', 'audiocpu', 'samples', 'dsbz80_mpegcpu', 'dsbz80_mpeg']) {
     const r = await fetch(`./dev-roms/${n}.bin`); if (!r.ok) throw new Error('dev ROM missing: ' + n);
-    if (!await host.writeRegion(n, new Uint8Array(await r.arrayBuffer()))) throw new Error('dev ROM not accepted: ' + n);
+    let bytes = new Uint8Array(await r.arrayBuffer());
+    // Banked CROM: only the 8 MB banks up to the last data, as the ZIP import keeps
+    // (rom_import_web.c, 2026-11-19): 64 of 128 MB in Scud Race Plus.
+    if (n === 'banked_crom') { const w = new Uint32Array(bytes.buffer); let e = w.length; while (e && !w[e - 1]) e--; bytes = bytes.subarray(0, Math.min(bytes.length, Math.ceil(e * 4 / 0x800000) * 0x800000)); }
+    if (!await host.writeRegion(n, bytes)) throw new Error('dev ROM not accepted: ' + n);
   }
   romLoaded('Development ROM regions loaded.');
 }
@@ -328,6 +386,7 @@ function continueIntent() {
 
 async function startEngine({ backup, env = {} }) {
   if (started) return;
+  if (!gpuReady) { $('errorNotice').hidden = !errorShown; return; }   // never without a working renderer (checkWebGPU)
   started = running = true;
   // A restart notice already up (Applying your race setup…) stays; else the short preparing one
   preparing = true; if ($('restartNotice').hidden) restartNotice({ view: sessionKind === 'link' ? 'prepare-link' : 'prepare-single' });
@@ -335,20 +394,39 @@ async function startEngine({ backup, env = {} }) {
   try { await audio.start(); } catch (e) { console.warn('[audio]', e); }
   $('soundBtn').disabled = false; updateSoundControls();
   const cpuTile = params.has('cputile');   // debug: 2D layers composed in WASM instead of WebGPU compute
-  try { renderer = await Daytona2Renderer.create($('screen'), './shaders/', { gpuTilegen: !cpuTile }); }
-  catch (e) { preparing = false; restartNotice(null); throw e; }
+  try { renderer = probed || await Daytona2Renderer.create($('screen'), './shaders/', { gpuTilegen: !cpuTile }); if (!probed) watchGPU(renderer); }
+  catch (e) { preparing = false; restartNotice(null); showError('The graphics card could not start', GPU_HELP, errorText(e)); throw e; }
   host.renderer = renderer;
   applyDisplay();
   host.unpaced = params.has('unpaced'); host.burst = Number(params.get('burst') || 1);   // benchmark: run fields back to back
   if (params.has('noaudio')) audio.setMuted(true);
   if (params.has('norender')) host.renderer = null;
   window.__d2 = window.__scud = { host, renderer, controls, room, audio };   // debugging aid (the D2 test tools read __d2)
-  renderer.device.addEventListener('uncapturederror', e => console.error('[webgpu]', e.error.message));
   await host.writeFile(BACKUP, backup);
   // ?devroms=1&denv=NAME=VALUE,... : extra engine variables for local diagnostics only.
   const devEnv = params.has('devroms') && params.get('denv') ? Object.fromEntries(params.get('denv').split(',').map(kv => kv.split('=')).filter(kv => /^(DAYTO|M3)_[A-Z0-9_]+$/.test(kv[0]))) : {};
-  host.start({ M3_BACKUP: BACKUP, ...env, ...devEnv, ...(params.get('profile') ? { DAYTO_VIDEO_PROFILE: '1' } : {}), ...(cpuTile ? { DAYTO_WEB_CPU_TILEGEN: '1' } : {}), ...(params.get('motion') ? { DAYTO_MOTION_TRACKING: '1' } : {}), ...(params.get('xform') === '0' ? { DAYTO_GPU_XFORM: '0' } : {}), DAYTO_WEB_INTERP: params.get('interp') === '0' ? '0' : '1', ...(fieldHz60 && sessionKind !== 'link' ? { M3_SOUND_FIELD_US: '16667' } : {}) });
+  host.start({ M3_BACKUP: BACKUP, ...env, ...devEnv, ...(params.get('profile') ? { DAYTO_VIDEO_PROFILE: '1' } : {}), ...(cpuTile ? { DAYTO_WEB_CPU_TILEGEN: '1' } : {}), ...(params.get('motion') ? { DAYTO_MOTION_TRACKING: '1' } : {}), ...(params.get('xform') === '0' ? { DAYTO_GPU_XFORM: '0' } : {}), DAYTO_WEB_INTERP: params.get('interp') === '0' ? '0' : '1', ...(fieldHz60 && sessionKind !== 'link' ? { M3_SOUND_FIELD_US: '16667' } : {}), ...(/^\d+$/.test(params.get('ppc') || '') ? { M3_PPC_MHZ: params.get('ppc') } : {}) });   // ?ppc=66: the guest CPU speed (tests; main_web.c, default 100)
   setInterval(requestSave, 30000);
+  // No new field for 12 s while the game should run (single play, page visible,
+  // not paused): the cabinet stopped without saying why (the iPhone's boot
+  // screen, 2026-11-19). Linked play waits for the others, so it is left out.
+  // The 12 s count only while this check itself runs on time: a hidden tab, a
+  // frozen page or a sleeping computer stop its timer too, so a late tick (over
+  // 4 s for a 2 s timer) or a page shown again starts the count afresh (user,
+  // 2026-11-19: no false alarm on returning to the tab).
+  let active = performance.now(), lastTick = active, stallShown = false;
+  const restartCount = () => { active = lastTick = performance.now(); };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) restartCount(); });
+  addEventListener('resume', restartCount); addEventListener('pageshow', restartCount);
+  setInterval(() => {
+    const now = performance.now(), late = now - lastTick > 4000; lastTick = now;
+    if (late || host.stopped || host.exited || host.paused || document.hidden || sessionKind !== 'single') { active = now; return; }
+    const last = Math.max(host.lastPresent || 0, active), stalled = now - last;
+    if (stalled < 12000 || stallShown) return;
+    stallShown = true;
+    showError('The game stopped responding', `No new picture from the arcade engine for ${Math.round(stalled / 1000)} s. Reload the page; if it happens again, please report the text below.`,
+      `fields ${host.fields || 0}, engine field ${host.ctl?.[8] ?? '?'}, engine ${(host.engineMs || 0).toFixed(1)} ms/field, waiting ${!!host.waiter}, in flight ${!!host.inFlight}`);
+  }, 2000);
   document.addEventListener('visibilitychange', () => { if (document.hidden) requestSave(); });
   // As Daytona USA Web's pause notice: a hidden tab slows this cabinet while the
   // others keep racing (the link never waits for it), so say so on return.

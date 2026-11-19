@@ -52,6 +52,11 @@ export class EngineHost {
     const q = new URLSearchParams(location.search);
     this.skipAllowed = q.get('skip') !== '0'; this.rafHz = Number(q.get('rafhz')) || 0; this.everyRefresh = q.get('everyrefresh') === '1';
     this.fixedT = q.has('interpt') ? Number(q.get('interpt')) : null;   // tests: Smooth draws every image this far between the last two fields
+    // Tests (2026-11-19, from Daytona USA 2 Web): ?late=0 never starts a field before
+    // the previous image is drawn, ?late=1 always (when its refresh passed); ?owe=0
+    // drops a field the lock could not start instead of owing it (see refreshLoop
+    // and schedule).
+    this.lateMode = q.get('late') ?? 'auto'; this.oweFields = q.get('owe') === '0' ? 1 : 2; this.engRecent = [0, 0, 0];
     this.skipping = false; this.skipSince = 0; this.skippedDraws = 0; this.skipEntries = 0;
     this.fields = 0; this.frameTimes = []; this.lastPresent = 0; this.slow = [];
     // Per-field trace ring (8192 fields, ~2.4 min) to find hitches: engine time,
@@ -97,8 +102,9 @@ export class EngineHost {
     if (d.t === 'backup') { this.backupSaved?.(d.bytes, d.path); return; }
     if (d.t === 'ready') { this.onReady(d); return; }
     if (d.t === 'started') { this.startedAt = performance.now(); return; }
-    if (d.t === 'exit') { console.error('[engine] exit', d.code); this.exited = true; return; }
-    if (d.t === 'abort' || d.t === 'error') { console.error('[engine]', d.what || d.message); this.exited = true; this.onFail?.(new Error(d.what || d.message)); return; }
+    // After the start, the page says so (main.js onError): the picture just stopped before (2026-11-19).
+    if (d.t === 'exit') { console.error('[engine] exit', d.code); this.exited = true; if (this.startedAt && !this.stopped) this.onError?.('engine', `the engine exited (code ${d.code})`); return; }
+    if (d.t === 'abort' || d.t === 'error') { console.error('[engine]', d.what || d.message); this.exited = true; this.onFail?.(new Error(d.what || d.message)); if (this.startedAt && !this.stopped) this.onError?.('engine', d.what || d.message); return; }
   }
   linkMessage(d) {
     const l = this.link; if (!l) return;
@@ -133,9 +139,21 @@ export class EngineHost {
     this.updateSpin();
   }
   // A packet is ready and the engine waits: draw it, then let the next field run when due.
+  // Each packet is taken once, by its count (ctl 1, which the engine raises after
+  // writing ctl 2, platform_web_target.c): from the engine's message or, first,
+  // from the refresh loop's own check (2026-11-19, Daytona USA 2 Web; see
+  // refreshLoop). Unpaced (benchmarks) every message.
   onPresent(packet) {
     if (this.stopped) return;
-    this.present(packet);
+    if (!this.unpaced) {
+      const n = Atomics.load(this.ctl, CTL.presented);
+      if (n === this.presentedSeen) return;   // already taken at a refresh
+      this.presentedSeen = n; packet = Atomics.load(this.ctl, CTL.packet) >>> 0;
+    }
+    // A drawing error must not stop the engine (it was never released again, and the
+    // picture froze with no word): reported once, and the fields go on.
+    try { this.present(packet); }
+    catch (e) { this.inFlight = false; this.renderFailed(e); }
     if (this.unpaced && (this.burst || 1) > 1) { this.resumedAt = performance.now(); return; }   // the engine did not wait
     this.nextField().then(() => this.release(), () => {});
   }
@@ -172,19 +190,25 @@ export class EngineHost {
     if (Atomics.exchange(this.ctl, CTL.resync, 0)) this.next = t0;   // a lockstep link wait: re-time from now
     if (this.input) this.input.write(heap, this.inputPtr);
     const t1 = performance.now();
-    if (this.renderer) this.renderer.upload(heap, packet);
+    if (this.renderer) {
+      this.renderer.upload(heap, packet);
+      // The model vertices now on the GPU: the engine drops its copy of them at
+      // its next scene build (web_bridge.cpp ack_statics). Before release().
+      const P = this.renderer.pull;
+      if (P && P.generation >= 0) { Atomics.store(this.ctl, CTL.staticUploaded, P.uploaded); Atomics.store(this.ctl, CTL.staticGeneration, P.generation); }
+    }
     const t2 = performance.now();
     // Vsync presentation: drawn on the next refresh (refreshLoop) while the
     // display is refreshing; at once otherwise (hidden or occluded window).
     if (this.vsyncPresent) this.refreshLoop();
     // While skipping, also a slow refresh (a GPU at 30 frames/s) draws only the newest field.
     if (this.renderer && this.vsyncPresent && (this.displayRefreshing(t2) || (this.skipping && t2 - this.lastRefresh < 100))) { if (this.pendingDraw) this.skippedDraws++; this.pendingDraw = true; }
-    else if (this.renderer) { this.renderer.render(); this.directDraws++; }
+    else if (this.renderer) { this.draw(); this.directDraws++; }
     const now = performance.now();
     if (now - t0 > 12 && this.slow.length < 64) this.slow.push({ field: this.trace.n, input: +(t1 - t0).toFixed(1), upload: +(t2 - t1).toFixed(1), render: +(now - t2).toFixed(1), ...Object.fromEntries(Object.entries(this.renderer?.timing || {}).map(([k, v]) => [k, +v.toFixed(1)])) });
     this.presentMs = (this.presentMs || 0) * 0.98 + (now - t0) * 0.02;
     const tr = this.trace, i = tr.n++ % tr.N, st = this.renderer?.stats;
-    tr.engine[i] = this.ctl[CTL.engineUs] / 1000; tr.scene[i] = this.ctl[CTL.sceneWaitUs] / 1000; tr.field[i] = this.ctl[CTL.field]; tr.board[i] = this.ctl[CTL.soundUs] / 1000; tr.boardWait[i] = this.ctl[21] / 1000; tr.present[i] = now - t0; tr.gap[i] = this.lastPresent ? now - this.lastPresent : 0;
+    tr.engine[i] = this.ctl[CTL.engineUs] / 1000; this.engRecent[tr.n % 3] = tr.engine[i]; tr.scene[i] = this.ctl[CTL.sceneWaitUs] / 1000; tr.field[i] = this.ctl[CTL.field]; tr.board[i] = this.ctl[CTL.soundUs] / 1000; tr.boardWait[i] = this.ctl[21] / 1000; tr.present[i] = now - t0; tr.gap[i] = this.lastPresent ? now - this.lastPresent : 0;
     tr.late[i] = this.lateMs || 0; if (st) { tr.rows[i] = st.textureRows; tr.verts[i] = st.vertexUploads; tr.chunks[i] = st.tileChunks; }
     if (this.lastPresent) { this.frameTimes.push(now - this.lastPresent); if (this.frameTimes.length > 120) this.frameTimes.shift(); }
     this.lastPresent = now; this.fields++;
@@ -277,6 +301,18 @@ export class EngineHost {
     return best && best.err < 0.02 ? { p: best.p, q: best.q, err: best.err, hz, acc: 0, due: 0 } : null;
   }
   drawPending(now) { return !this.skipping && this.pendingDraw && this.displayRefreshing(now); }
+  // Late start (2026-11-19, from Daytona USA 2 Web) only when the field cannot be
+  // ready before the next refresh anyway: the shortest of the last three fields
+  // (engine time) would end after it. A quick field started at once replaced the
+  // waiting image before it was shown (one image held three refreshes, then a
+  // jump of two fields); it waits for the draw instead, and the lock owes it
+  // (oweFields).
+  startLate(now) {
+    if (this.lateMode === '0') return false;
+    if (this.lateMode === '1') return true;
+    const next = this.lastRefresh + 1000 / this.lock.hz;
+    return now + Math.min(...this.engRecent) > next + 1;
+  }
   updateSkip(now) {
     if (!this.skipAllowed || this.paused || this.refreshCount < 60) { this.skipSince = 0; return; }
     const slow = this.gapAvg > this.fieldMs * 1.06, fast = this.gapAvg < this.fieldMs * 1.02;
@@ -288,6 +324,16 @@ export class EngineHost {
     this.next = now;
     console.info(`[engine] frame skipping ${this.skipping ? 'on' : 'off'}: display ${(1000 / this.gapAvg).toFixed(1)} Hz, fields ${(1000 / this.fieldMs).toFixed(1)} Hz`);
   }
+  // Draw, reporting a drawing error once: a throw here skipped afterDraw (the
+  // next field's release) and the picture froze with no word (2026-11-19).
+  draw(t) {
+    try { this.renderer.render(t); }
+    catch (e) { this.renderFailed(e); }
+  }
+  renderFailed(e) {   // the first few in the console, the first one on screen
+    if ((this.renderErrors = (this.renderErrors || 0) + 1) <= 3) console.error('[render]', e);
+    if (!this.renderError) { this.renderError = e; this.onError?.('render', e?.stack || e); }
+  }
   refreshLoop() {
     if (this.refreshing) return;
     this.refreshing = true;
@@ -298,6 +344,14 @@ export class EngineHost {
     const raf = period ? f => { const now = performance.now(); due += period; if (due < now - 4 * period) due = now; const at = due; setTimeout(() => f(Math.floor(at * 10) / 10), Math.max(0, at - now)); } : f => requestAnimationFrame(f);
     const frame = t => {
       raf(frame);
+      // A packet the engine finished before this refresh is taken now, not when its
+      // message arrives (2026-11-19, Daytona USA 2 Web): on the user's 75 Hz display
+      // ~2.6% of the engine's messages reached the page ~8 ms late, always just
+      // after the next refresh, so the image missed it and the one before stayed
+      // three refreshes. Scud's engine posts the same way.
+      if (!this.unpaced && this.ctl && this.presentedSeen !== undefined && Atomics.load(this.ctl, CTL.presented) !== this.presentedSeen) {
+        this.polledPresents = (this.polledPresents || 0) + 1; this.onPresent();
+      }
       const now = performance.now();
       this.refreshGap = this.lastRefresh ? now - this.lastRefresh : 1e9;
       const stale = this.refreshGap >= 25;
@@ -349,18 +403,22 @@ export class EngineHost {
       const hold = !interp && active && L.q >= 2 * L.p && !L.due && this.pendingDraw && (this.held = (this.held || 0) + 1) < Math.ceil(L.q / L.p);
       if (interp && this.fields) {   // every refresh, between the last two fields
         this.pendingDraw = false; this.vsyncDraws++; this.interpDraws = (this.interpDraws || 0) + 1; this.held = 0;
-        this.renderer.render(interpT); this.lastInterpT = interpT;
+        this.draw(interpT); this.lastInterpT = interpT;
         (this.interpHist ??= new Uint32Array(11))[Math.round(interpT * 10)]++;   // diagnostics (test tools)
         const f = this.afterDraw; this.afterDraw = null; if (f) this.yieldNow(f);
       } else if (this.pendingDraw && !hold) {
         this.pendingDraw = false; this.vsyncDraws++; this.held = 0;
-        this.renderer.render();
+        this.draw();
         const f = this.afterDraw; this.afterDraw = null; if (f) this.yieldNow(f);   // after this frame is handed over
       }
       if (!active) return;
       // No catching up (as Supermodel): a field the engine could not start in
       // time is not run twice in a row later.
-      if (L.due > 1) L.due = 1;
+      // One field owed at most (2026-11-19, from Daytona USA 2 Web): a field whose
+      // start a late image held back is run at the pattern's next spare refresh
+      // (one that would show an image twice) instead of being lost: the game keeps
+      // its speed with no image replaced (see schedule's late start).
+      if (L.due > this.oweFields) L.due = this.oweFields;
       // The field starts in a task of its own (2026-11-14), not inside this refresh's
       // rendering step: resuming the engine here (a microtask, 7-12 ms) held back the
       // frame just drawn, so it reached the screen late at random (uneven cadence).
@@ -382,7 +440,18 @@ export class EngineHost {
       if (early > 0.5) { this.arm(tick, early); return; }
       // The previous field is still waiting for its refresh: this field starts
       // once it is drawn (or after 25 ms if refreshes stop).
-      if (this.drawPending(performance.now())) { this.afterDraw = tick; this.arm(tick, 25); return; }
+      // Late field (2026-11-19, from Daytona USA 2 Web): when a refresh that was due
+      // for this field already passed while the engine still ran the previous one
+      // (a slow field, 13-23 ms in a race), it starts at once instead of after the
+      // next refresh draws the previous image, a whole refresh later; without it
+      // every slow field on a 75 Hz display lost a field (D2: 55.6 Hz in a race).
+      // Only when the field would end after the next refresh anyway (startLate);
+      // a quick one waits for the draw and the lock owes it (oweFields).
+      if (this.drawPending(performance.now())) {
+        const now = performance.now(), L = this.lock;
+        if (this.locked(now) && L.due && this.startLate(now)) { this.lateStarts = (this.lateStarts || 0) + 1; this.startLocked(now, false)(); return; }
+        this.afterDraw = tick; this.arm(tick, 25); return;
+      }
       // Display lock: the refresh loop starts the field; this timer only takes
       // over if the refreshes stop (hidden or occluded window).
       if (this.locked(performance.now())) {
@@ -408,8 +477,22 @@ export class EngineHost {
     tick();
   }
   arm(fn, ms) {
-    clearTimeout(this.timer);
+    clearTimeout(this.timer); this.timer = 0; this.clockFn = null;
+    // Hidden tab (2026-11-19): the page's own timers are throttled there
+    // (Chrome: ~1 wake-up/s without sound), so the wait goes to a worker's
+    // timer (clock-worker.js); a linked cabinet in another tab ran ~2 fields/s
+    // and the cabinets never got past the link boot.
+    if (document.hidden && this.clock()) { this.clockFn = fn; this.clockWorker.postMessage({ id: ++this.clockId, ms }); return; }
     this.timer = setTimeout(() => { this.timer = 0; fn(); }, ms);
+  }
+  clock() {
+    if (this.clockWorker === undefined) {
+      try {
+        this.clockWorker = new Worker('./clock-worker.js', { name: 'scud-clock' }); this.clockId = 0;
+        this.clockWorker.onmessage = e => { if (e.data !== this.clockId || !this.clockFn) return; const f = this.clockFn; this.clockFn = null; f(); };
+      } catch { this.clockWorker = null; }
+    }
+    return this.clockWorker;
   }
   yieldNow(resolve) {
     if (!this.channel) { this.channel = new MessageChannel(); this.channel.port1.onmessage = () => { const q = this.queue; this.queue = []; q.forEach(f => f()); }; this.queue = []; }
@@ -422,8 +505,8 @@ export class EngineHost {
     if (this.stopped || !this.worker) return;
     this.stopped = true;
     Atomics.store(this.ctl, CTL.stop, 1); Atomics.add(this.ctl, CTL.go, 1); Atomics.notify(this.ctl, CTL.go);
-    clearTimeout(this.timer); this.afterDraw = null; this.waiter = null; this.queue = [];
-    setTimeout(() => { try { this.worker.terminate(); } catch {} }, 50);
+    clearTimeout(this.timer); this.clockFn = null; this.afterDraw = null; this.waiter = null; this.queue = [];
+    setTimeout(() => { try { this.worker.terminate(); this.clockWorker?.terminate(); } catch {} }, 50);
   }
   // Smooth motion (display interpolation): the engine pairs the scene's instances
   // with the previous scene's only while it is on (ctl 25, web_bridge.cpp publish).
@@ -472,4 +555,4 @@ const FULL_SPIN = 'scud-full-spin-v1';
 function readFlag(k) { try { return localStorage.getItem(k) === '1'; } catch { return false; } }
 function writeFlag(k) { try { localStorage.setItem(k, '1'); } catch {} }
 export const CTL = Object.freeze({ go: 0, presented: 1, packet: 2, save: 3, stop: 4, unpaced: 5, burst: 6, engineUs: 7, field: 8, waitUs: 9, resync: 10, soundUs: 11,
-  rumbleStrong: 12, rumbleWeak: 13, wheel: 14, wheelValid: 18, sceneWaitUs: 19, linkPhase: 20, boardWaitUs: 21, spin: 22, nextUs: 23, spinLeadUs: 24, interp: 25, lateWakes: 26, words: 32 });
+  rumbleStrong: 12, rumbleWeak: 13, wheel: 14, wheelValid: 18, sceneWaitUs: 19, linkPhase: 20, boardWaitUs: 21, spin: 22, nextUs: 23, spinLeadUs: 24, interp: 25, lateWakes: 26, staticUploaded: 27, staticGeneration: 28, words: 32 });

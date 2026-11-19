@@ -8,3 +8,14 @@
 .restart-spinner{display:block;width:26px;height:26px;margin:0 auto 14px;border:3px solid #d6d6cc;border-top-color:#a40909;border-radius:50%;animation:restart-spin .8s linear infinite}
 @keyframes restart-spin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.restart-spinner{animation-duration:2.4s}}
+/* Errors the player must see (2026-11-19): no WebGPU, the GPU lost or out of memory, the engine stopped. */
+.error-notice{z-index:60}
+.error-notice .restart-card{width:min(100%,460px);text-align:left}
+.error-notice .room-eyebrow{color:#a40909}
+.error-detail{margin:12px 0 0;padding:8px 10px;max-height:9em;overflow:auto;font:11px/1.4 ui-monospace,Consolas,monospace;color:#2b2b28;white-space:pre-wrap;word-break:break-word;background:#0000000d;border:1px solid #0000001f;border-radius:4px;user-select:text}
+.error-detail[hidden]{display:none}
+.error-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.error-actions button{min-height:40px;padding:0 16px;font:800 14px/1 inherit;font-family:inherit;border-radius:4px;cursor:pointer}
+.error-actions #errorReload{color:#fff;background:linear-gradient(#4a8cff,#2366e8);border:2px solid #1747b0;box-shadow:0 2px 0 #123a94}
+.error-actions #errorClose{color:#2b2b28;background:#fff;border:2px solid #b4b6b7}
+.error-actions button:focus-visible{outline:3px solid #8bb8ff;outline-offset:2px}

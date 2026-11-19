@@ -231,6 +231,10 @@
   <div id="restartNotice" class="restart-notice" role="alertdialog" aria-modal="true" aria-labelledby="restartTitle" aria-describedby="restartText" hidden>
     <section class="restart-card"><span class="restart-spinner" aria-hidden="true"></span><span id="restartEyebrow" class="room-eyebrow"></span><h2 id="restartTitle">Restarting the cabinet</h2><p id="restartText">One moment…</p></section>
   </div>
+  <div id="errorNotice" class="restart-notice error-notice" role="alertdialog" aria-modal="true" aria-labelledby="errorTitle" aria-describedby="errorText" hidden>
+    <section class="restart-card"><span id="errorEyebrow" class="room-eyebrow">PROBLEM</span><h2 id="errorTitle">The game cannot start</h2><p id="errorText"></p><pre id="errorDetail" class="error-detail" hidden></pre>
+      <div class="error-actions"><button id="errorReload" class="ui-button ui-primary" type="button">Reload page</button><button id="errorClose" class="ui-button ui-secondary" type="button">Close</button></div></section>
+  </div>
   <div id="menuGamepadHints" class="menu-gamepad-hints" role="status" aria-label="Controller menu controls" hidden></div>
   <script type="module" src="main.js"></script>
   <small id="buildVersion" class="build-version">v0.9.8 · <time datetime="2026-11-18">18.11.26</time></small>
