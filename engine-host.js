@@ -13,6 +13,7 @@
 // The engine never runs on this thread, so a field's 5-10 ms of work no longer
 // holds back the page, its input or the frame just drawn.
 
+import { CLIENT_VERSION } from './version.js';
 export const FIELD_MS = 17.385;   // the arcade: 57.524 fields/s (Model 3 video timing)
 // 60 Hz mode (?hz=60, single play only): the game runs at 60 fields/s, as Supermodel does by
 // default (RefreshRate = 60): 4.3% faster than the arcade, one field per
@@ -66,12 +67,16 @@ export class EngineHost {
   // Start the engine worker and wait for its module (pthreads preloaded).
   async load(scriptUrl = './scudplus.js') {
     if (!globalThis.crossOriginIsolated) throw new Error('This page is not cross-origin isolated, so the engine cannot share memory with it. Reload the page once (the page installs a helper that enables it), or use a current Chrome or Edge.');
-    this.worker = new Worker('./engine-worker.js', { name: 'scud-engine' });
+    // Every engine file carries the version (2026-11-19): GitHub Pages lets a browser keep
+    // files 10 minutes, and an iPhone ran the 0.9.8 page with the 0.9.7 engine.
+    const v = encodeURIComponent(CLIENT_VERSION);
+    this.worker = new Worker(`./engine-worker.js?v=${v}`, { name: 'scud-engine' });
     this.replies = new Map(); this.replyId = 0;
     const ready = new Promise((resolve, reject) => { this.onReady = resolve; this.onFail = reject; });
     this.worker.onmessage = e => this.message(e.data);
     this.worker.onerror = e => { console.error('[engine worker]', e.message || e); this.onFail?.(new Error('Engine worker failed: ' + (e.message || 'error'))); };
-    this.worker.postMessage({ t: 'init', script: new URL(scriptUrl, location.href).href });
+    const script = new URL(scriptUrl, location.href); script.searchParams.set('v', CLIENT_VERSION);
+    this.worker.postMessage({ t: 'init', script: script.href, v: CLIENT_VERSION });
     const r = await ready;
     this.memory = r.memory; this.cores = r.cores;
     this.ctlPtr = r.control; this.inputPtr = r.input; this.audioPtr = r.audio; this.ramPtr = r.ram;

@@ -98,6 +98,7 @@ self.onmessage = async e => {
       M = await createScudEngine({
         noInitialRun: true,
         mainScriptUrlOrBlob: d.script,
+        locateFile: (path, prefix) => prefix + path + (path.endsWith('.wasm') && d.v ? `?v=${encodeURIComponent(d.v)}` : ''),   // the wasm of this version, not a cached one
         print: t => log(t), printErr: t => log(t),
         onExit: code => post({ t: 'exit', code }),
         // abort() arrives with no reason ("", 2026-11-19, iPhone): the reason is the

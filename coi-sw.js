@@ -27,7 +27,10 @@ self.addEventListener('fetch', event => {
   if (url.origin !== self.location.origin) return;   // only the site's own responses get the headers
   event.respondWith((async () => {
     let response;
-    try { response = await fetch(r); } catch (e) { return Response.error(); }
+    // The site's files are revalidated (ETag, a 304 when unchanged) instead of taken from
+    // the HTTP cache, which GitHub Pages keeps 10 minutes: a page of one version with
+    // scripts of another (2026-11-19, iPhone). A navigation request cannot be copied.
+    try { response = await fetch(r.mode === 'navigate' ? r : new Request(r, { cache: 'no-cache' })); } catch (e) { return Response.error(); }
     if (response.status === 0 || response.type === 'opaque') return response;
     const headers = new Headers(response.headers);
     headers.set('Cross-Origin-Opener-Policy', 'same-origin');
