@@ -10,6 +10,13 @@
 // up to 1% faster or slower (linear interpolation), so it neither runs dry
 // nor builds up delay. Adaptive target (2026-11-14): each underrun raises it,
 // calm periods lower it again.
+// Output level (2026-11-19, user: "even at 100% it sounds low"): the board's
+// mix peaks near -10 dBFS with an average near -27 dBFS (attract and a race,
+// measured on the engine's WAV), far below what other pages play. It is
+// raised by a fixed GAIN (+8 dB); a soft knee above KNEE bends only the rare
+// peaks that would pass it, so the output never clips hard.
+const GAIN = 2.5, KNEE = 0.8, ROOM = 1 - KNEE;
+const limit = x => x > KNEE ? KNEE + ROOM * Math.tanh((x - KNEE) / ROOM) : x < -KNEE ? -KNEE - ROOM * Math.tanh((-x - KNEE) / ROOM) : x;
 class ScudAudio extends AudioWorkletProcessor {
   constructor() {
     super(); this.ring = null; this.frac = 0; this.level = 0; this.primed = false;
@@ -24,7 +31,7 @@ class ScudAudio extends AudioWorkletProcessor {
   process(_, outputs) {
     const out = outputs[0], L = out[0], R = out[1] || out[0], g = this.ring;
     if (!g) { L.fill(0); if (R !== L) R.fill(0); return true; }
-    const write = Atomics.load(g.head, 0), mask = g.frames - 1, k = 1 / 32768;
+    const write = Atomics.load(g.head, 0), mask = g.frames - 1, k = GAIN / 32768;
     let count = (write - this.read) | 0;
     if (count > g.frames) { this.read = write - g.frames; count = g.frames; }   // never behind the writer by a whole ring
     if (!this.primed && count >= Math.max(3072, this.target >> 1)) { this.primed = true; this.level = count; }   // ~70 ms to absorb field jitter
@@ -38,7 +45,7 @@ class ScudAudio extends AudioWorkletProcessor {
       if (this.primed && count > 1) {
         const a = this.read & mask, b = (this.read + 1) & mask, f = this.frac;
         const la = d[2 * a] * k, ra = d[2 * a + 1] * k;
-        L[i] = la + (d[2 * b] * k - la) * f; R[i] = ra + (d[2 * b + 1] * k - ra) * f;
+        L[i] = limit(la + (d[2 * b] * k - la) * f); R[i] = limit(ra + (d[2 * b + 1] * k - ra) * f);
         this.frac += this.rate;
         while (this.frac >= 1 && count > 1) { this.frac -= 1; this.read++; count--; }
       } else {
