@@ -1,6 +1,6 @@
 # Scud Race Plus — Web
 
-Version 0.9.4
+Version 0.9.5
 
 A static recompilation of the arcade game *Scud Race Plus* (Sega Model 3 Step 1.5, 1997), running in the browser with WebAssembly and WebGPU. Single player and online linked races for up to 8 drivers.
 
