@@ -17,6 +17,7 @@
 let M = null, roms = null, link = null, started = false;
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
 const log = text => post({ t: 'log', text: String(text) });
+const heapMB = () => { try { return Math.round(M.wasmMemory.buffer.byteLength / 1048576); } catch { return '?'; } };
 
 // ---- the CENTRAL LINK transport, engine side (src/comm_central.c, DAYTO_WEB) ----
 // The page's CentralLinkNet (central-link-net.js) owns the WebRTC links and
@@ -96,7 +97,10 @@ self.onmessage = async e => {
         mainScriptUrlOrBlob: d.script,
         print: t => log(t), printErr: t => log(t),
         onExit: code => post({ t: 'exit', code }),
-        onAbort: what => post({ t: 'abort', what: String(what) }),
+        // An abort without a reason is std::terminate (2026-11-19, iPhone): almost
+        // always a failed allocation after the heap could not grow, so the heap
+        // size goes with it instead of "undefined".
+        onAbort: what => post({ t: 'abort', what: what === undefined || what === null ? `engine aborted with no reason (likely out of memory; heap ${heapMB()} MB)` : String(what) }),
         daytonaHost,
       });
       post({ t: 'ready', memory: M.wasmMemory, control: M._dayto_web_control_ptr(), input: M._dayto_web_input_ptr(), audio: M._dayto_web_audio_ring(), ram: M._dayto_web_ram_ptr(), cores: navigator.hardwareConcurrency || 0 });

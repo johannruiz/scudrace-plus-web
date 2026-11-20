@@ -104,7 +104,7 @@ export class EngineHost {
     if (d.t === 'started') { this.startedAt = performance.now(); return; }
     // After the start, the page says so (main.js onError): the picture just stopped before (2026-11-19).
     if (d.t === 'exit') { console.error('[engine] exit', d.code); this.exited = true; if (this.startedAt && !this.stopped) this.onError?.('engine', `the engine exited (code ${d.code})`); return; }
-    if (d.t === 'abort' || d.t === 'error') { console.error('[engine]', d.what || d.message); this.exited = true; this.onFail?.(new Error(d.what || d.message)); if (this.startedAt && !this.stopped) this.onError?.('engine', d.what || d.message); return; }
+    if (d.t === 'abort' || d.t === 'error') { const why = d.what || d.message || `engine ${d.t} with no reason (${JSON.stringify(d)})`; d.what = why; console.error('[engine]', why); this.exited = true; this.onFail?.(new Error(d.what || d.message)); if (this.startedAt && !this.stopped) this.onError?.('engine', d.what || d.message); return; }
   }
   linkMessage(d) {
     const l = this.link; if (!l) return;
