@@ -201,6 +201,8 @@ export class EngineHost {
       // its next scene build (web_bridge.cpp ack_statics). Before release().
       const P = this.renderer.pull;
       if (P && P.generation >= 0) { Atomics.store(this.ctl, CTL.staticUploaded, P.uploaded); Atomics.store(this.ctl, CTL.staticGeneration, P.generation); }
+      // A refused model-vertex buffer: the engine sends them all again (webgpu-renderer.js repair).
+      Atomics.store(this.ctl, CTL.staticReset, this.renderer.staticReset | 0);
     }
     const t2 = performance.now();
     // Vsync presentation: drawn on the next refresh (refreshLoop) while the
@@ -560,4 +562,4 @@ const FULL_SPIN = 'scud-full-spin-v1';
 function readFlag(k) { try { return localStorage.getItem(k) === '1'; } catch { return false; } }
 function writeFlag(k) { try { localStorage.setItem(k, '1'); } catch {} }
 export const CTL = Object.freeze({ go: 0, presented: 1, packet: 2, save: 3, stop: 4, unpaced: 5, burst: 6, engineUs: 7, field: 8, waitUs: 9, resync: 10, soundUs: 11,
-  rumbleStrong: 12, rumbleWeak: 13, wheel: 14, wheelValid: 18, sceneWaitUs: 19, linkPhase: 20, boardWaitUs: 21, spin: 22, nextUs: 23, spinLeadUs: 24, interp: 25, lateWakes: 26, staticUploaded: 27, staticGeneration: 28, words: 32 });
+  rumbleStrong: 12, rumbleWeak: 13, wheel: 14, wheelValid: 18, sceneWaitUs: 19, linkPhase: 20, boardWaitUs: 21, spin: 22, nextUs: 23, spinLeadUs: 24, interp: 25, lateWakes: 26, staticUploaded: 27, staticGeneration: 28, staticReset: 29, words: 32 });

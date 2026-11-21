@@ -294,6 +294,7 @@ function errorContext() {
   try {
     if (host?.memory) lines.push(`Engine: ${Math.round(host.memory.buffer.byteLength / 1048576)} MB, field ${host.ctl?.[8] ?? '-'}, ${host.fields || 0} shown, ${r?.stats?.staticVertices || 0} model vertices`);
     if (r?.pull?.statics) lines.push(`GPU model buffer: ${Math.round(r.pull.statics.size / 1048576)} MB, target ${r.targetW}x${r.targetH}`);
+    if (r?.refusals?.count) lines.push(`Graphics memory refused ${r.refusals.count} times (made again); last ${r.refusals.last}`);
     const lim = r?.device?.limits || gpuLimits;
     lines.push(`WebGPU: ${gpuInfo || '-'}${lim ? `; max buffer ${Math.round(lim.maxBufferSize / 1048576)} MB, storage ${Math.round(lim.maxStorageBufferBindingSize / 1048576)} MB` : ''}`);
     lines.push(`Device: screen ${screen.width}x${screen.height} @${devicePixelRatio}, isolated ${globalThis.crossOriginIsolated}, cores ${navigator.hardwareConcurrency || '?'}, memory ${navigator.deviceMemory || '?'} GB`);
@@ -316,6 +317,7 @@ class GPUUnavailable extends Error {}
 // gpuReady, probed: declared with the page state (view() reads them).
 async function checkWebGPU() {
   stage = 'checking WebGPU';
+  { const t = /^(\w+):(\d+)$/.exec(params.get('gpurefuse') || ''); if (t) Daytona2Renderer.testRefuse = { label: t[1], n: +t[2] }; }   // tests: webgpu-renderer.js makeBuffer
   if (!('gpu' in navigator)) throw new GPUUnavailable('This browser has no WebGPU.');
   let adapter = null; try { adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); } catch (e) { throw new GPUUnavailable('WebGPU failed: ' + errorText(e)); }
   if (!adapter) throw new GPUUnavailable('WebGPU found no graphics adapter (graphics acceleration off or not supported).');
@@ -325,11 +327,22 @@ async function checkWebGPU() {
   watchGPU(probed);
   gpuReady = true; stage = 'loading the engine';
 }
+// Refused graphics memory (2026-11-20, webgpu-renderer.js makeBuffer): the
+// renderer makes the buffer again and the game goes on, so a refusal is only
+// logged; the draws that used the refused buffer report errors until the next
+// field, and those are dropped too when a refusal came within 5 s of them.
+// Refusals that keep coming (onRefused) and other errors still stop the page.
 function watchGPU(r) {
+  const memoryText = 'The browser could not give the game enough graphics memory. Close other tabs and apps, then reload the page.';
+  r.onRefused = m => showError('Out of graphics memory', memoryText, m);
   r.device.addEventListener('uncapturederror', e => {
     const m = e.error?.message || String(e.error); console.error('[webgpu]', m);
-    if (e.error?.constructor?.name === 'GPUOutOfMemoryError') showError('Out of graphics memory', 'The browser could not give the game enough graphics memory. Close other tabs and apps, then reload the page.', m);
-    else showError('Graphics error', 'The graphics card reported an error, so the picture may be wrong or stopped. Reload the page; if it happens again, please report the text below.', m);
+    if (e.error?.constructor?.name === 'GPUOutOfMemoryError') { showError('Out of graphics memory', memoryText, m); return; }
+    const at = performance.now();
+    setTimeout(() => {
+      if (Math.abs(r.refusals.at - at) < 5000) return;
+      showError('Graphics error', 'The graphics card reported an error, so the picture may be wrong or stopped. Reload the page; if it happens again, please report the text below.', m);
+    }, 1000);
   });
   r.device.lost.then(info => {
     if (info.reason === 'destroyed' || host?.stopped) return;

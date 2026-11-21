@@ -122,17 +122,65 @@ export class Daytona2Renderer {
     this.textureGroup = device.createBindGroup({ layout: this.r3dLayout0, entries: [{ binding: 0, resource: this.textureRam.createView() }] });
     this.drawData = new Float32Array(0);
     this.stats = { draws: 0, vertexUploads: 0, textureRows: 0, layerUploads: 0 };
+    this.refusals = { count: 0, at: -1e9, last: '', recent: [] }; this.broken = new Set(); this.tight = false; this.staticReset = 0; this.made = {};
+  }
+  // Graphics memory the browser refuses while the game runs (Claude 2026-11-20).
+  // An AMD card in a launcher on a 4 GB PC refused one buffer ("Out of graphics
+  // memory", CreateBuffer) at field 2235: the device was not lost and the game
+  // ran on, but the page called it fatal, and the refused buffer stayed
+  // invalid (no 3D until the next course). Each buffer made during play goes
+  // through an out-of-memory error scope; a refused one is made again at the
+  // next field (repair) with less spare room, and when it held the model
+  // vertices the engine is asked for all of them again (ctl 29, r3d_scene.h
+  // request_static_reset). Only refusals that keep coming reach the player
+  // (onRefused). Test: ?gpurefuse=LABEL:N (main.js) refuses the Nth buffer of
+  // that label in play, by destroying it (the same errors as an invalid one).
+  makeBuffer(label, size, usage) {
+    const device = this.device, n = this.made[label] = (this.made[label] || 0) + 1;
+    device.pushErrorScope('out-of-memory');
+    const buffer = device.createBuffer({ label, size, usage });
+    device.popErrorScope().then(e => { if (e) this.refused(label, buffer, size, e.message); }, () => {});
+    const t = Daytona2Renderer.testRefuse;
+    if (t && t.label === label && t.n === n) { buffer.destroy(); setTimeout(() => this.refused(label, buffer, size, '(test: ?gpurefuse)'), 20); }
+    return buffer;
+  }
+  refused(label, buffer, size, message) {
+    const R = this.refusals, now = performance.now();
+    R.count++; R.at = now; R.last = `${label}, ${(size / 1048576).toFixed(1)} MB: ${String(message).split(String.fromCharCode(10))[0]}`;
+    R.recent = R.recent.filter(t => now - t < 60000); R.recent.push(now);
+    this.tight = true;
+    if (buffer) this.broken.add(buffer);
+    console.warn(`[webgpu] graphics memory refused (${R.last}); made again at the next field, ${R.count} so far`);
+    if (R.recent.length >= 4) this.onRefused?.(`${R.recent.length} refusals in a minute; last ${R.last}`);
+  }
+  repair() {
+    if (!this.broken.size) return;
+    const P = this.pull, labels = new Set([...this.broken].map(b => b.label));
+    for (const name of ['refs', 'instances', 'cpu', 'colours', 'prevm']) if (this.broken.has(P[name])) { P[name] = null; P.group = null; }
+    // The model vertices are uploaded once: any of this set's copies refused (a
+    // larger one copies the last) means the engine must send them all again.
+    if (labels.has('statics') && P.generation >= 0) {
+      P.statics?.destroy(); P.statics = null; P.group = null;
+      P.resetFrom = P.generation; P.generation = -1; P.uploaded = 0; this.staticReset++;
+    }
+    if (this.broken.has(this.vertexBuffer)) { this.vertexBuffer = null; this.vertexCapacity = 0; }
+    if (this.broken.has(this.drawBuffer)) { this.drawBuffer = null; this.drawCapacity = 0; }
+    for (const b of this.broken) b.destroy();
+    this.broken.clear();
   }
   ensureTargets(w, h) {
     if (w === this.targetW && h === this.targetH) return;
     this.targetW = w; this.targetH = h;
     this.color?.destroy(); this.depth?.destroy();
+    this.device.pushErrorScope('out-of-memory');
     this.color = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     this.depth = this.device.createTexture({ size: [w, h], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
     this.composeGroup = this.device.createBindGroup({ layout: this.composePipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: this.color.createView() }, { binding: 1, resource: this.front.createView() },
       { binding: 2, resource: this.back.createView() }, { binding: 3, resource: this.nearest },
       { binding: 4, resource: this.linear }, { binding: 5, resource: { buffer: this.composeUniform } }] });
+    // Refused targets (refused above): made again at the next render.
+    this.device.popErrorScope().then(e => { if (e && this.targetW === w && this.targetH === h) { this.targetW = 0; this.refused(`targets ${w}x${h}`, null, w * h * 12, e.message); } }, () => {});
   }
   // The model vertex buffer with room for `bytes`, keeping what it holds: the
   // engine no longer has those vertices (uploadPull). Scud preloads ~1 M (~97 MB)
@@ -141,9 +189,10 @@ export class Daytona2Renderer {
   growStatics(bytes) {
     const P = this.pull, old = P.statics, need = Math.max(256, bytes);
     if (old && old.size >= need) return;
-    const size = Math.min(this.device.limits.maxStorageBufferBindingSize, Math.max(need * (need > 48 << 20 ? 1.25 : 2), 1 << 16)) + 3 & ~3;
+    const spare = this.tight ? 1.1 : need > 48 << 20 ? 1.25 : 2;   // tight: after a refusal (makeBuffer)
+    const size = Math.min(this.device.limits.maxStorageBufferBindingSize, Math.max(need * spare, 1 << 16)) + 3 & ~3;
     if (size < need) throw new Error(`[webgpu] statics: ${need} bytes over the device limit`);
-    const buffer = this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    const buffer = this.makeBuffer('statics', size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
     if (old && P.uploaded) {   // queued after the writes that filled the old one
       const encoder = this.device.createCommandEncoder();
       encoder.copyBufferToBuffer(old, 0, buffer, 0, P.uploaded * STATIC_BYTES);
@@ -156,9 +205,9 @@ export class Daytona2Renderer {
     const b = this.pull[name], need = Math.max(256, bytes);
     if (b && b.size >= need) return false;
     b?.destroy();
-    const size = Math.min(this.device.limits.maxStorageBufferBindingSize, Math.max(need * spare, 1 << 16)) + 3 & ~3;
+    const size = Math.min(this.device.limits.maxStorageBufferBindingSize, Math.max(need * (this.tight ? 1.1 : spare), 1 << 16)) + 3 & ~3;
     if (size < need) throw new Error(`[webgpu] ${name}: ${need} bytes over the device limit`);
-    this.pull[name] = this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.pull[name] = this.makeBuffer(name, size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     this.pull.group = null;
     return true;
   }
@@ -166,6 +215,11 @@ export class Daytona2Renderer {
   // scene; model-space vertices only from where the GPU copy ends.
   uploadPull(heap, u32) {
     const queue = this.device.queue, P = this.pull;
+    // Waiting for the resend (repair): scenes of the lost set draw no 3D.
+    if (P.resetFrom !== undefined) {
+      if (u32[38] === P.resetFrom) { P.serial = u32[39]; this.interpOK = false; P.group = null; return; }
+      P.resetFrom = undefined;
+    }
     const put = (name, ptr, bytes) => { this.ensurePull(name, bytes); if (bytes) queue.writeBuffer(P[name], 0, heap.buffer, ptr, bytes); };
     put('refs', u32[31], u32[30] * REF_BYTES);
     // Display interpolation: each instance's matrix in the previous scene (packet
@@ -211,6 +265,7 @@ export class Daytona2Renderer {
   }
   // Upload what changed in the packet (scene, texture rows, 2D layers).
   upload(heap, packet) {
+    this.repair();
     const u32 = new Uint32Array(heap.buffer, packet, PACKET_WORDS);
     const device = this.device, queue = device.queue;
     if (u32[24] && u32[29]) {   // scene_changed, GPU transform
@@ -223,7 +278,7 @@ export class Daytona2Renderer {
       if (bytes > this.vertexCapacity) {
         this.vertexBuffer?.destroy();
         this.vertexCapacity = Math.max(bytes * 1.5 | 0, 1 << 20);
-        this.vertexBuffer = device.createBuffer({ size: this.vertexCapacity, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        this.vertexBuffer = this.makeBuffer('vertices', this.vertexCapacity, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
       }
       if (bytes) queue.writeBuffer(this.vertexBuffer, 0, heap.buffer, u32[2], bytes);
       this.vertexCount = count; this.stats.vertexUploads++;
@@ -269,6 +324,7 @@ export class Daytona2Renderer {
   }
   // interpT (display interpolation, engine-host.js): where between the last two scenes to draw.
   render(interpT = 1) {
+    this.repair();
     const device = this.device, rt0 = performance.now();
     const dpr = window.devicePixelRatio || 1;
     const cw = Math.max(1, Math.round(this.canvas.clientWidth * dpr)), ch = Math.max(1, Math.round(this.canvas.clientHeight * dpr));
@@ -334,7 +390,7 @@ export class Daytona2Renderer {
     const need = Math.max(1, draws.length) * DRAW_STRIDE;
     if (need > this.drawCapacity) {
       this.drawBuffer?.destroy(); this.drawCapacity = Math.max(need * 2, 64 * DRAW_STRIDE);
-      this.drawBuffer = device.createBuffer({ size: this.drawCapacity, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.drawBuffer = this.makeBuffer('draws', this.drawCapacity, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       this.drawGroup = device.createBindGroup({ layout: this.r3dLayout1, entries: [{ binding: 0, resource: { buffer: this.drawBuffer, size: 192 } }] });
       this.drawData = new Float32Array(this.drawCapacity / 4);
     }
