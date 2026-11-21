@@ -350,6 +350,23 @@ function watchGPU(r) {
     showError('The graphics card stopped', 'The browser stopped the game’s graphics (WebGPU device lost), often because it ran out of graphics memory. Close other tabs and apps, then reload the page.', info.message || info.reason || '');
   });
 }
+// Force feedback for a wheel bridge (2026-11-21): the Arcade Launcher's SDL3
+// bridge reads it (its src/game/adapter.js, 125 times a second). The forces
+// are the drive board's own, from its Z80 program (src/drive_board.c): a
+// constant torque -1..1 (+ = right), the centring spring, the vibration and
+// the servo board's gain, 0..1; damper and friction are 0 (the board has
+// neither). While the game is paused, a menu is open, the page is hidden or
+// the engine stopped, `live` is false and every force 0: the engine keeps its
+// last values then, and a wheel must not hold them.
+window.arcadeForceFeedback = Object.freeze({
+  version: 1, game: 'scud',
+  read() {
+    const f = host?.ffb;
+    const live = !!f && f[7] === 1 && !host.paused && !host.stopped && !host.exited && $('overlay').hidden && !document.hidden;
+    return live ? { constant: f[1], spring: f[2], damper: f[3], friction: f[4], rumble: f[5], gain: f[6], live: true }
+      : { constant: 0, spring: 0, damper: 0, friction: 0, rumble: 0, gain: 0, live: false };
+  },
+});
 async function loadEngine() {
   await checkWebGPU();
   host = new EngineHost({ audio, input: controls, link, onField: h => onField(h) });
@@ -397,7 +414,7 @@ $('changeROM').addEventListener('click', () => { if (started) { restartWith({ vi
 // Development: ?devroms=1 loads prepared regions served by web/tools/serve.js.
 async function devRoms() {
   await engineReady;
-  for (const n of ['crom', 'banked_crom', 'vrom', 'audiocpu', 'samples', 'dsbz80_mpegcpu', 'dsbz80_mpeg']) {
+  for (const n of ['crom', 'banked_crom', 'vrom', 'audiocpu', 'samples', 'dsbz80_mpegcpu', 'dsbz80_mpeg', 'drivebd']) {
     const r = await fetch(`./dev-roms/${n}.bin`); if (!r.ok) throw new Error('dev ROM missing: ' + n);
     let bytes = new Uint8Array(await r.arrayBuffer());
     // Banked CROM: only the 8 MB banks up to the last data, as the ZIP import keeps
@@ -464,7 +481,7 @@ async function startEngine({ backup, env = {} }) {
   await host.writeFile(BACKUP, backup);
   // ?devroms=1&denv=NAME=VALUE,... : extra engine variables for local diagnostics only.
   const devEnv = params.has('devroms') && params.get('denv') ? Object.fromEntries(params.get('denv').split(',').map(kv => kv.split('=')).filter(kv => /^(DAYTO|M3)_[A-Z0-9_]+$/.test(kv[0]))) : {};
-  host.start({ M3_BACKUP: BACKUP, ...env, ...devEnv, ...(params.get('profile') ? { DAYTO_VIDEO_PROFILE: '1' } : {}), ...(params.get('abortat') ? { DAYTO_TEST_ABORT: params.get('abortat') } : {}), ...(params.get('slowscene') ? { DAYTO_TEST_SCENE_DELAY: params.get('slowscene') } : {}), ...(cpuTile ? { DAYTO_WEB_CPU_TILEGEN: '1' } : {}), ...(params.get('motion') ? { DAYTO_MOTION_TRACKING: '1' } : {}), ...(params.get('xform') === '0' ? { DAYTO_GPU_XFORM: '0' } : {}), DAYTO_WEB_INTERP: params.get('interp') === '0' ? '0' : '1', ...(fieldHz60 && sessionKind !== 'link' ? { M3_SOUND_FIELD_US: '16667' } : {}), ...(/^\d+$/.test(params.get('ppc') || '') ? { M3_PPC_MHZ: params.get('ppc') } : {}) });   // ?ppc=66: the guest CPU speed (tests; main_web.c, default 100)
+  host.start({ M3_BACKUP: BACKUP, ...env, ...devEnv, ...(params.get('profile') ? { DAYTO_VIDEO_PROFILE: '1' } : {}), ...(params.get('abortat') ? { DAYTO_TEST_ABORT: params.get('abortat') } : {}), ...(params.get('slowscene') ? { DAYTO_TEST_SCENE_DELAY: params.get('slowscene') } : {}), ...(params.get('driveboard') === '0' ? { DAYTO_DRIVE_Z80: '0' } : {}), ...(cpuTile ? { DAYTO_WEB_CPU_TILEGEN: '1' } : {}), ...(params.get('motion') ? { DAYTO_MOTION_TRACKING: '1' } : {}), ...(params.get('xform') === '0' ? { DAYTO_GPU_XFORM: '0' } : {}), DAYTO_WEB_INTERP: params.get('interp') === '0' ? '0' : '1', ...(fieldHz60 && sessionKind !== 'link' ? { M3_SOUND_FIELD_US: '16667' } : {}), ...(/^\d+$/.test(params.get('ppc') || '') ? { M3_PPC_MHZ: params.get('ppc') } : {}) });   // ?ppc=66: the guest CPU speed (tests; main_web.c, default 100)
   setInterval(requestSave, 30000);
   // No new field for 12 s while the game should run (single play, page visible,
   // not paused): the cabinet stopped without saying why (the iPhone's boot

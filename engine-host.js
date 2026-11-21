@@ -79,7 +79,7 @@ export class EngineHost {
     this.worker.postMessage({ t: 'init', script: script.href, v: CLIENT_VERSION });
     const r = await ready;
     this.memory = r.memory; this.cores = r.cores;
-    this.ctlPtr = r.control; this.inputPtr = r.input; this.audioPtr = r.audio; this.ramPtr = r.ram;
+    this.ctlPtr = r.control; this.inputPtr = r.input; this.audioPtr = r.audio; this.ramPtr = r.ram; this.ffbPtr = r.ffb || 0;
     this.views();
     // Compatibility with the shell (main.js): what it used to read from the module.
     const host = this;
@@ -96,6 +96,7 @@ export class EngineHost {
   views() {
     const b = this.memory.buffer; this.heapU8 = new Uint8Array(b);
     this.ctl = new Int32Array(b, this.ctlPtr, CTL.words); this.ctlF = new Float32Array(b, this.ctlPtr, CTL.words);
+    this.ffb = this.ffbPtr ? new Float32Array(b, this.ffbPtr, 8) : null;   // wheel effects (platform_web_target.c dayto_web_ffb)
   }
   // The engine's memory may grow: the views follow it.
   heap() { if (this.heapU8.byteLength !== this.memory.buffer.byteLength) this.views(); return this.heapU8; }

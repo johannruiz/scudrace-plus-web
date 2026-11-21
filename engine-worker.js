@@ -106,7 +106,7 @@ self.onmessage = async e => {
         onAbort: what => post({ t: 'abort', what: (what === undefined || what === null || what === '' ? '' : String(what) + '; ') + abortReport() }),
         daytonaHost,
       });
-      post({ t: 'ready', memory: M.wasmMemory, control: M._dayto_web_control_ptr(), input: M._dayto_web_input_ptr(), audio: M._dayto_web_audio_ring(), ram: M._dayto_web_ram_ptr(), cores: navigator.hardwareConcurrency || 0 });
+      post({ t: 'ready', memory: M.wasmMemory, control: M._dayto_web_control_ptr(), input: M._dayto_web_input_ptr(), audio: M._dayto_web_audio_ring(), ram: M._dayto_web_ram_ptr(), ffb: M._dayto_web_ffb_ptr ? M._dayto_web_ffb_ptr() : 0, cores: navigator.hardwareConcurrency || 0 });
     } else if (d.t === 'alloc') {
       // Memory (2026-11-18, as Daytona USA 2 Web): the page writes large data
       // (the ROM ZIP, dev ROM regions) straight into the engine's shared
