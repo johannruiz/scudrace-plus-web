@@ -13,7 +13,7 @@ const VERTEX_BYTES = 80, VIEWPORT_FLOATS = 56, DRAW_STRIDE = 256;
 // GPU vertex transform (web_bridge.cpp WebFrame 29..38, r3d_scene.h): refs,
 // model-space vertices kept across frames, instances, colour-table entries.
 const STATIC_BLOCK = 65536;   // r3d_scene.h R3D_STATIC_BLOCK
-const PACKET_WORDS = 43, REF_BYTES = 8, STATIC_BYTES = 96, INSTANCE_BYTES = 80;
+const PACKET_WORDS = 44, REF_BYTES = 8, STATIC_BYTES = 96, INSTANCE_BYTES = 80;
 
 export function computeLayout(winW, winH, maxAspect) {   // r3d_renderer.cpp compute_layout
   const aspect = winH > 0 ? winW / winH : 4 / 3;
@@ -120,6 +120,7 @@ export class Daytona2Renderer {
     this.linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     this.composeUniform = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.textureGroup = device.createBindGroup({ layout: this.r3dLayout0, entries: [{ binding: 0, resource: this.textureRam.createView() }] });
+    this.secretSheet = false; this.fullTexture = false;
     this.drawData = new Float32Array(0);
     this.stats = { draws: 0, vertexUploads: 0, textureRows: 0, layerUploads: 0 };
     this.refusals = { count: 0, at: -1e9, last: '', recent: [] }; this.broken = new Set(); this.tight = false; this.staticReset = 0; this.made = {};
@@ -213,6 +214,22 @@ export class Daytona2Renderer {
   }
   // GPU transform: refs, instances, colours and CPU-path vertices every new
   // scene; model-space vertices only from where the GPU copy ends.
+  // Scud's secret vehicles on every course (2026-11-25): Super Beginner's
+  // texture RAM (2048x2048 16-bit texels, made by the engine from the ROM:
+  // web_bridge.cpp build_secret_sheet, frame word 43) becomes rows 2048..4095
+  // of the sheet, which r3d.wgsl samples for the polygons of those models. The
+  // sheet is made again twice as tall; its first half is then sent whole.
+  setSecretSheet(buffer, offset) {
+    if (!this.secretSheet) {
+      const old = this.textureRam;
+      this.textureRam = this.device.createTexture({ size: [2048, 4096], format: 'r16uint', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.textureGroup = this.device.createBindGroup({ layout: this.r3dLayout0, entries: [{ binding: 0, resource: this.textureRam.createView() }] });
+      old.destroy(); this.fullTexture = true;
+    }
+    this.device.queue.writeTexture({ texture: this.textureRam, origin: [0, 2048] }, buffer, { offset, bytesPerRow: 4096 }, [2048, 2048]);
+    this.secretSheet = true;
+    return true;
+  }
   uploadPull(heap, u32) {
     const queue = this.device.queue, P = this.pull;
     // Waiting for the resend (repair): scenes of the lost set draw no 3D.
@@ -282,6 +299,11 @@ export class Daytona2Renderer {
       }
       if (bytes) queue.writeBuffer(this.vertexBuffer, 0, heap.buffer, u32[2], bytes);
       this.vertexCount = count; this.stats.vertexUploads++;
+    }
+    if (u32[43] && !this.secretSheet) this.setSecretSheet(heap.buffer, u32[43]);   // once, when the engine made it
+    if (this.fullTexture && u32[5]) {   // the sheet was made again (setSecretSheet): all of it
+      this.fullTexture = false;
+      queue.writeTexture({ texture: this.textureRam, origin: [0, 0] }, heap.buffer, { offset: u32[5], bytesPerRow: 4096 }, [2048, 2048]);
     }
     if (u32[24]) {
       if (u32[6]) {   // dirty texture rows: upload runs of consecutive rows
@@ -353,7 +375,8 @@ export class Daytona2Renderer {
       if (v.full && !v.framedSky) { uniform[0] /= widen; uniform[8] /= widen; }
       uniform.set(vps.subarray(o + 24, o + 28), 16);   // sun
       uniform.set(vps.subarray(o + 28, o + 32), 20);   // fog colour
-      uniform.set(vps.subarray(o + 32, o + 36), 24);   // ambient, density, start
+      uniform.set(vps.subarray(o + 32, o + 36), 24);   // ambient, density, start, secret cars' sheet (web_bridge.cpp)
+      if (!this.secretSheet) uniform[27] = 0;
       uniform[31] = t; uniform[30] = v.full ? 2 * lay.gameX0 / lay.viewW : 0; uniform[29] = 1;   // quality.zw (w: interpolation) / aniso
       uniform.set(vps.subarray(o + 36, o + 52), 32);   // original light
       // WebGPU rejects a viewport outside the target (the whole frame is then

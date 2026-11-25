@@ -15,13 +15,14 @@ struct Draw {
   quality: vec4<f32>,    // x: pass (1 opaque, -1 translucent, -1000 translucent depth), z: HUD shift
   light_shape: vec4<f32>, light_color: vec4<f32>, light_fog: vec4<f32>, light_controls: vec4<f32>,
 };
-@group(0) @binding(0) var texture_ram: texture_2d<u32>;   // 2048x2048 r16uint (as r32uint)
+@group(0) @binding(0) var texture_ram: texture_2d<u32>;   // 2048x2048 r16uint (as r32uint); 2048x4096 with the secret cars' sheet below
 @group(1) @binding(0) var<uniform> vp: Draw;
 
 const TEXTURED = 1u; const ALPHA_TEST = 2u; const MIRROR_U = 4u; const MIRROR_V = 8u;
 const SMOOTH_U = 16u; const SMOOTH_V = 32u; const LUMINOUS = 64u; const FIXED_SHADE = 128u;
 const SPECULAR = 256u; const TEX_ALPHA = 512u; const INVERT_RGB = 4096u; const TRANSLATOR = 8192u;
 const STEP15_LUMINOUS = 524288u; const HARDWARE_LOD = 1048576u; const HARDWARE_LIGHTING = 2097152u; const SMOOTH_SHADE = 4194304u;
+const SECRET_SHEET = 8388608u;   // r3d_scene.h R3D_SECRET_SHEET
 
 struct VIn {
   @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>,
@@ -156,7 +157,12 @@ fn wrap(c: i32, size: i32, mirror: bool) -> i32 {
 fn fetch(base: vec2<i32>, size: vec2<i32>, c0: vec2<i32>, fmt: u32, addressing: u32, flags: u32) -> vec4<f32> {
   let cx = wrap(c0.x, size.x, (addressing & MIRROR_U) != 0u);
   let cy = wrap(c0.y, size.y, (addressing & MIRROR_V) != 0u);
-  let p = vec2<i32>((base.x + cx) & 2047, (base.y & 1024) | ((base.y + cy) & 1023));
+  var p = vec2<i32>((base.x + cx) & 2047, (base.y & 1024) | ((base.y + cy) & 1023));
+  // Scud's secret vehicles off Super Beginner (2026-11-25): their textures come
+  // from that course's texture RAM, rows 2048.. (webgpu-renderer.js
+  // setSecretSheet; vp.params.w: the course is not Super Beginner and the
+  // sheet is there). Mip levels and micro texture as well, as on that course.
+  if ((flags & SECRET_SHEET) != 0u && vp.params.w > 0.5) { p.y += 2048; }
   var t = decode(textureLoad(texture_ram, p, 0).r, fmt);
   if ((flags & (TEX_ALPHA | ALPHA_TEST)) == 0u) { t.a = 1.0; }
   return t;
